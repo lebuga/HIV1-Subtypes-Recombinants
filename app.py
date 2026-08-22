@@ -1,59 +1,53 @@
-# ==================================================================================================
-# MODEL-09 — CURRENT 9-MODEL BENCHMARK STREAMLIT DEPLOYMENT
+# =============================================================================
+# MODEL-09 HIV-1 RECOMBINANT CLASSIFIER
+# CURRENT 9-MODEL BENCHMARK DEPLOYMENT
 #
-# CURRENT BENCHMARK PIPELINE
-#
-# RAW HIV-1 PROTEIN SEQUENCE
-#        ↓
-# ESM-2 t33 650M
-#        ↓
-# residue-level embeddings
-#        ↓
-# complete non-overlapping 48-aa chunks
-#        ↓
-# mean + max pooling
-#        ↓
-# 2560-D token representation
-#        ↓
-# pad / truncate to 91 tokens
-#        ↓
-# TRAIN-ONLY benchmark standardization
-#        ↓
-# MODEL-09
-# Bidirectional Attention Transformer Encoder
-#        ↓
-# sigmoid probability
-#        ↓
-# frozen validation threshold = 0.71
-#        ↓
-# RECOMBINANT / NON-RECOMBINANT
-#
-# REQUIRED REPOSITORY ARTIFACTS
+# AUTHORITATIVE DEPLOYMENT ARTIFACTS:
 #
 # artifacts/
-#   MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt
-#   MODEL-09_BENCHMARK_TRAIN_MEAN.npy
-#   MODEL-09_BENCHMARK_TRAIN_STD.npy
-#   MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt
+# ├── MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt
+# ├── MODEL-09_BENCHMARK_TRAIN_MEAN.npy
+# ├── MODEL-09_BENCHMARK_TRAIN_STD.npy
+# └── MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt
+#
+# REPRESENTATION:
+#
+# Raw protein sequence
+#       ↓
+# ESM-2 t33 650M
+#       ↓
+# residue embeddings: 1280-D
+#       ↓
+# complete 48-aa chunks
+#       ↓
+# mean + max
+#       ↓
+# 2560-D tokens
+#       ↓
+# pad to 91 tokens
+#       ↓
+# TRAIN-ONLY standardization
+#       ↓
+# MODEL-09
+#       ↓
+# frozen validation threshold
+#       ↓
+# Non-Recombinant / Recombinant
 #
 # IMPORTANT:
-# - X is accepted as an amino-acid character.
-# - MultiheadAttention receives exactly 3-D tensors:
-#       [batch, tokens, model_dim]
-# - No 4-D tensor is passed to attention.
-# - This is the CURRENT 9-MODEL BENCHMARK pipeline.
-# ==================================================================================================
+# The LocalAttentionBlock and GlobalAttentionBlock below MUST match
+# the architecture used when the benchmark checkpoint was trained.
+# =============================================================================
 
 
-# ==================================================================================================
+# =============================================================================
 # 1. IMPORTS
-# ==================================================================================================
+# =============================================================================
 
-from pathlib import Path
 import os
 import re
-import hashlib
 import time
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
@@ -61,12 +55,17 @@ import streamlit as st
 import torch
 import torch.nn as nn
 
-from transformers import AutoTokenizer, EsmModel
+try:
+    from transformers import AutoTokenizer, EsmModel
+except Exception as e:
+    AutoTokenizer = None
+    EsmModel = None
+    TRANSFORMERS_IMPORT_ERROR = e
 
 
-# ==================================================================================================
-# 2. STREAMLIT PAGE
-# ==================================================================================================
+# =============================================================================
+# 2. PAGE CONFIGURATION
+# =============================================================================
 
 st.set_page_config(
     page_title="MODEL-09 HIV-1 Recombinant Classifier",
@@ -75,15 +74,51 @@ st.set_page_config(
 )
 
 
-# ==================================================================================================
-# 3. BENCHMARK CONSTANTS
-# ==================================================================================================
+# =============================================================================
+# 3. PROJECT PATHS
+# =============================================================================
 
-ESM_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+ARTIFACTS_DIR = (
+    PROJECT_ROOT
+    / "artifacts"
+)
+
+
+MODEL_CHECKPOINT = (
+    ARTIFACTS_DIR
+    / "MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt"
+)
+
+TRAIN_MEAN_PATH = (
+    ARTIFACTS_DIR
+    / "MODEL-09_BENCHMARK_TRAIN_MEAN.npy"
+)
+
+TRAIN_STD_PATH = (
+    ARTIFACTS_DIR
+    / "MODEL-09_BENCHMARK_TRAIN_STD.npy"
+)
+
+FROZEN_THRESHOLD_PATH = (
+    ARTIFACTS_DIR
+    / "MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt"
+)
+
+
+# =============================================================================
+# 4. MODEL / REPRESENTATION CONFIGURATION
+# =============================================================================
+
+ESM_MODEL_NAME = (
+    "facebook/esm2_t33_650M_UR50D"
+)
 
 ESM2_DIMENSION = 1280
 
 CHUNK_SIZE = 48
+
 CHUNK_STRIDE = 48
 
 INPUT_DIM = 2560
@@ -91,430 +126,233 @@ INPUT_DIM = 2560
 TOKEN_LENGTH = 91
 
 MODEL_DIM = 96
+
 ATTENTION_HEADS = 4
 
 BASE_DROPOUT = 0.30
+
 ATTENTION_DROPOUT = 0.25
 
 REPRESENTATION_NOISE = 0.015
 
-FROZEN_THRESHOLD_DEFAULT = 0.71
-
-SEED = 42
-
-
-# ==================================================================================================
-# 4. DEVICE
-# ==================================================================================================
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ==================================================================================================
-# 5. REPOSITORY / ARTIFACT PATH RESOLUTION
-# ==================================================================================================
-
-# Streamlit Cloud normally runs with the repository as the current working directory.
-# However, do NOT assume that os.getcwd() is the repository root.
+# CRITICAL:
+# Recovered from the checkpoint parameter count:
 #
-# This function searches several safe locations and returns the first directory
-# containing the required deployment artifacts.
-
-REQUIRED_ARTIFACT_NAMES = [
-    "MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt",
-    "MODEL-09_BENCHMARK_TRAIN_MEAN.npy",
-    "MODEL-09_BENCHMARK_TRAIN_STD.npy",
-    "MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt",
-]
-
-
-def find_repository_root():
-
-    candidates = []
-
-    try:
-        candidates.append(
-            Path(__file__).resolve().parent
-        )
-    except Exception:
-        pass
-
-    candidates.append(
-        Path.cwd()
-    )
-
-    candidates.append(
-        Path("/mount/src/hiv1-subtypes-recombinants")
-    )
-
-    candidates.append(
-        Path("/app")
-    )
-
-    seen = set()
-
-    for candidate in candidates:
-
-        try:
-            candidate = candidate.resolve()
-        except Exception:
-            continue
-
-        if str(candidate) in seen:
-            continue
-
-        seen.add(str(candidate))
-
-        if candidate.exists():
-            return candidate
-
-    return Path.cwd()
-
-
-PROJECT_ROOT = find_repository_root()
-
-
-def locate_artifacts():
-
-    possible_artifact_dirs = [
-
-        PROJECT_ROOT / "artifacts",
-
-        PROJECT_ROOT,
-
-        Path.cwd() / "artifacts",
-
-        Path.cwd(),
-
-        Path("/mount/src/hiv1-subtypes-recombinants/artifacts"),
-
-        Path("/mount/src/hiv1-subtypes-recombinants"),
-
-    ]
-
-    checked = []
-
-    for directory in possible_artifact_dirs:
-
-        try:
-            directory = directory.resolve()
-        except Exception:
-            continue
-
-        if directory in checked:
-            continue
-
-        checked.append(directory)
-
-        if not directory.exists():
-            continue
-
-        if all(
-            (directory / name).is_file()
-            for name in REQUIRED_ARTIFACT_NAMES
-        ):
-
-            return directory
-
-    return None
-
-
-ARTIFACT_DIR = locate_artifacts()
-
-
-# ==================================================================================================
-# 6. ARTIFACT ERROR REPORT
-# ==================================================================================================
-
-def artifact_error_message():
-
-    lines = []
-
-    lines.append(
-        "Required MODEL-09 deployment artifacts could not be found."
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"Repository root detected:\n{PROJECT_ROOT}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "Expected directory:"
-    )
-
-    lines.append(
-        str(PROJECT_ROOT / "artifacts")
-    )
-
-    lines.append("")
-
-    lines.append(
-        "Required files:"
-    )
-
-    for name in REQUIRED_ARTIFACT_NAMES:
-
-        lines.append(
-            f"  {name}"
-        )
-
-    lines.append("")
-
-    lines.append(
-        "Checked locations:"
-    )
-
-    possible_dirs = [
-
-        PROJECT_ROOT / "artifacts",
-        PROJECT_ROOT,
-        Path.cwd() / "artifacts",
-        Path.cwd(),
-        Path("/mount/src/hiv1-subtypes-recombinants/artifacts"),
-        Path("/mount/src/hiv1-subtypes-recombinants"),
-    ]
-
-    for directory in possible_dirs:
-
-        lines.append(
-            f"  {directory}"
-        )
-
-    return "\n".join(lines)
-
-
-# ==================================================================================================
-# 7. LOAD DEPLOYMENT ARTIFACTS
-# ==================================================================================================
-
-if ARTIFACT_DIR is None:
-
-    st.error(
-        "MODEL-09 could not be initialized."
-    )
-
-    st.code(
-        artifact_error_message(),
-        language="text"
-    )
-
-    st.stop()
-
-
-CHECKPOINT_PATH = (
-    ARTIFACT_DIR
-    /
-    "MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt"
-)
-
-TRAIN_MEAN_PATH = (
-    ARTIFACT_DIR
-    /
-    "MODEL-09_BENCHMARK_TRAIN_MEAN.npy"
-)
-
-TRAIN_STD_PATH = (
-    ARTIFACT_DIR
-    /
-    "MODEL-09_BENCHMARK_TRAIN_STD.npy"
-)
-
-THRESHOLD_PATH = (
-    ARTIFACT_DIR
-    /
-    "MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt"
+# MODEL-09 total parameters = 418,882
+#
+# This requires:
+#
+# FF_DIM = 192
+#
+# Do not change this.
+FF_DIM = 192
+
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
 )
 
 
-# ==================================================================================================
-# 8. VERIFY ARTIFACT FILES
-# ==================================================================================================
+# =============================================================================
+# 5. APPLICATION HEADER
+# =============================================================================
 
-missing_artifacts = []
+st.title(
+    "🧬 MODEL-09 HIV-1 Recombinant Classifier"
+)
 
-for path in [
+st.caption(
+    "Current 9-model benchmark deployment"
+)
 
-    CHECKPOINT_PATH,
-    TRAIN_MEAN_PATH,
-    TRAIN_STD_PATH,
-    THRESHOLD_PATH
+st.write(
+    "MODEL-09 uses residue-level ESM-2 embeddings, "
+    "complete 48-residue tokens, a 2560-D mean+max representation, "
+    "91-token padding, train-only standardization, and the frozen "
+    "benchmark decision threshold."
+)
 
-]:
 
-    if not path.is_file():
+# =============================================================================
+# 6. ARTIFACT VERIFICATION
+# =============================================================================
 
-        missing_artifacts.append(
-            str(path)
+def verify_artifacts():
+
+    required = {
+        "MODEL-09 checkpoint":
+            MODEL_CHECKPOINT,
+
+        "Training mean":
+            TRAIN_MEAN_PATH,
+
+        "Training std":
+            TRAIN_STD_PATH,
+
+        "Frozen threshold":
+            FROZEN_THRESHOLD_PATH
+    }
+
+    missing = []
+
+    for name, path in required.items():
+
+        if not path.exists():
+
+            missing.append(
+                f"{name}: {path}"
+            )
+
+    if missing:
+
+        raise FileNotFoundError(
+            "Required MODEL-09 deployment artifacts are missing:\n\n"
+            + "\n".join(missing)
+            + "\n\nExpected directory:\n"
+            + str(ARTIFACTS_DIR)
         )
 
-
-if missing_artifacts:
-
-    st.error(
-        "MODEL-09 deployment artifacts are incomplete."
-    )
-
-    st.code(
-        "\n".join(
-            missing_artifacts
-        ),
-        language="text"
-    )
-
-    st.stop()
+    return required
 
 
-# ==================================================================================================
-# 9. LOAD STANDARDIZATION ARTIFACTS
-# ==================================================================================================
+# =============================================================================
+# 7. LOAD FROZEN STANDARDIZATION
+# =============================================================================
 
-try:
+@st.cache_data(show_spinner=False)
+def load_standardization():
 
-    TRAIN_MEAN = np.load(
+    mean = np.load(
         TRAIN_MEAN_PATH
     ).astype(
         np.float32
     )
 
-    TRAIN_STD = np.load(
+    std = np.load(
         TRAIN_STD_PATH
     ).astype(
         np.float32
     )
 
-except Exception as exc:
+    if mean.shape != (
+        1,
+        1,
+        INPUT_DIM
+    ):
 
-    st.error(
-        "Failed to load MODEL-09 standardization artifacts."
-    )
+        raise RuntimeError(
+            "Invalid training mean shape: "
+            f"{mean.shape}. Expected "
+            f"(1, 1, {INPUT_DIM})."
+        )
 
-    st.exception(exc)
+    if std.shape != (
+        1,
+        1,
+        INPUT_DIM
+    ):
 
-    st.stop()
+        raise RuntimeError(
+            "Invalid training std shape: "
+            f"{std.shape}. Expected "
+            f"(1, 1, {INPUT_DIM})."
+        )
 
+    if not np.all(
+        np.isfinite(mean)
+    ):
 
-# ==================================================================================================
-# 10. STANDARDIZATION SHAPE VERIFICATION
-# ==================================================================================================
+        raise RuntimeError(
+            "Training mean contains non-finite values."
+        )
 
-if TRAIN_MEAN.shape != (
-    1,
-    1,
-    INPUT_DIM
-):
+    if not np.all(
+        np.isfinite(std)
+    ):
 
-    st.error(
-        "MODEL-09 training mean has an unexpected shape."
-    )
+        raise RuntimeError(
+            "Training std contains non-finite values."
+        )
 
-    st.code(
-        f"Expected: (1, 1, {INPUT_DIM})\n"
-        f"Received: {TRAIN_MEAN.shape}",
-        language="text"
-    )
+    if np.any(
+        std <= 0
+    ):
 
-    st.stop()
+        raise RuntimeError(
+            "Training std contains zero or negative values."
+        )
 
-
-if TRAIN_STD.shape != (
-    1,
-    1,
-    INPUT_DIM
-):
-
-    st.error(
-        "MODEL-09 training std has an unexpected shape."
-    )
-
-    st.code(
-        f"Expected: (1, 1, {INPUT_DIM})\n"
-        f"Received: {TRAIN_STD.shape}",
-        language="text"
-    )
-
-    st.stop()
+    return mean, std
 
 
-if not np.all(
-    np.isfinite(TRAIN_MEAN)
-):
+# =============================================================================
+# 8. LOAD FROZEN THRESHOLD
+# =============================================================================
 
-    st.error(
-        "Training mean contains non-finite values."
-    )
+@st.cache_data(show_spinner=False)
+def load_frozen_threshold():
 
-    st.stop()
-
-
-if not np.all(
-    np.isfinite(TRAIN_STD)
-):
-
-    st.error(
-        "Training std contains non-finite values."
-    )
-
-    st.stop()
-
-
-if np.any(
-    TRAIN_STD <= 0
-):
-
-    st.error(
-        "Training std contains zero or negative values."
-    )
-
-    st.stop()
-
-
-# ==================================================================================================
-# 11. LOAD FROZEN THRESHOLD
-# ==================================================================================================
-
-try:
-
-    threshold_text = (
-        THRESHOLD_PATH
+    text = (
+        FROZEN_THRESHOLD_PATH
         .read_text(
             encoding="utf-8"
         )
         .strip()
     )
 
-    FROZEN_THRESHOLD = float(
-        threshold_text
+    # Allow files such as:
+    #
+    # 0.7100000000
+    #
+    # or:
+    #
+    # Frozen validation threshold: 0.7100000000
+
+    match = re.search(
+        r"(?<!\d)(0(?:\.\d+)?|1(?:\.0+)?)(?!\d)",
+        text
     )
 
-except Exception as exc:
+    if match is None:
 
-    st.error(
-        "Could not read MODEL-09 frozen threshold."
+        raise RuntimeError(
+            "Could not parse frozen threshold from:\n"
+            + str(FROZEN_THRESHOLD_PATH)
+        )
+
+    threshold = float(
+        match.group(1)
     )
 
-    st.exception(exc)
+    if not (
+        0.0
+        <= threshold
+        <= 1.0
+    ):
 
-    st.stop()
+        raise RuntimeError(
+            f"Invalid frozen threshold: {threshold}"
+        )
 
-
-if not (
-    0.0 < FROZEN_THRESHOLD < 1.0
-):
-
-    st.error(
-        f"Invalid frozen threshold: {FROZEN_THRESHOLD}"
-    )
-
-    st.stop()
+    return threshold
 
 
-# ==================================================================================================
-# 12. LOCAL ATTENTION BLOCK
-# ==================================================================================================
+# =============================================================================
+# 9. LOCAL ATTENTION BLOCK
+#
+# THIS IS THE IMPORTANT CHECKPOINT-COMPATIBLE VERSION.
+#
+# State-dict keys expected by the checkpoint:
+#
+# local_attention.norm1.*
+# local_attention.norm2.*
+# local_attention.ff.0.*
+# local_attention.ff.3.*
+#
+# and equivalent global_attention keys.
+# =============================================================================
 
 class LocalAttentionBlock(
     nn.Module
@@ -523,25 +361,43 @@ class LocalAttentionBlock(
     def __init__(
         self,
         dim=MODEL_DIM,
-        heads=ATTENTION_HEADS,
-        dropout=ATTENTION_DROPOUT
+        heads=ATTENTION_HEADS
     ):
 
         super().__init__()
 
-        self.norm = nn.LayerNorm(
-            dim
-        )
-
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=heads,
-            dropout=dropout,
+            dropout=ATTENTION_DROPOUT,
             batch_first=True
         )
 
-        self.dropout = nn.Dropout(
-            dropout
+        self.norm1 = nn.LayerNorm(
+            dim
+        )
+
+        self.norm2 = nn.LayerNorm(
+            dim
+        )
+
+        self.ff = nn.Sequential(
+
+            nn.Linear(
+                dim,
+                FF_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                BASE_DROPOUT
+            ),
+
+            nn.Linear(
+                FF_DIM,
+                dim
+            )
         )
 
     def forward(
@@ -549,47 +405,59 @@ class LocalAttentionBlock(
         x
     ):
 
-        # ------------------------------------------------------------------------------------------
-        # CRITICAL SHAPE GUARD
+        # x MUST be:
         #
-        # MultiheadAttention with batch_first=True requires:
+        # [batch, tokens, model_dim]
         #
-        # [batch, sequence_length, embedding_dimension]
-        #
-        # Therefore x MUST be 3-D.
-        # ------------------------------------------------------------------------------------------
+        # = [B, T, 96]
 
-        if x.dim() != 3:
+        if x.ndim != 3:
 
             raise RuntimeError(
                 "LocalAttentionBlock expected a 3-D tensor "
-                f"[batch, tokens, dim], but received "
-                f"shape={tuple(x.shape)}"
+                f"[B,T,D], received shape {tuple(x.shape)}."
             )
 
-        z = self.norm(
+        z = self.norm1(
             x
         )
 
-        attended, _ = self.attn(
-            z,
-            z,
-            z,
-            need_weights=False
-        )
-
-        return (
-            x
-            +
-            self.dropout(
-                attended
+        attn_output, _ = (
+            self.attn(
+                z,
+                z,
+                z,
+                need_weights=False
             )
         )
 
+        x = (
+            x
+            + attn_output
+        )
 
-# ==================================================================================================
-# 13. GLOBAL ATTENTION BLOCK
-# ==================================================================================================
+        z = self.norm2(
+            x
+        )
+
+        x = (
+            x
+            + self.ff(z)
+        )
+
+        return x
+
+
+# =============================================================================
+# 10. GLOBAL ATTENTION BLOCK
+#
+# The original benchmark used the same block structure.
+# The separate class is retained because the checkpoint contains:
+#
+# global_attention.norm1
+# global_attention.norm2
+# global_attention.ff
+# =============================================================================
 
 class GlobalAttentionBlock(
     LocalAttentionBlock
@@ -598,9 +466,9 @@ class GlobalAttentionBlock(
     pass
 
 
-# ==================================================================================================
-# 14. ATTENTION POOLING
-# ==================================================================================================
+# =============================================================================
+# 11. ATTENTION POOLING
+# =============================================================================
 
 class AttentionPooling(
     nn.Module
@@ -633,17 +501,19 @@ class AttentionPooling(
         x
     ):
 
-        if x.dim() != 3:
+        if x.ndim != 3:
 
             raise RuntimeError(
-                "AttentionPooling expected a 3-D tensor "
-                f"[batch, tokens, dim], got {tuple(x.shape)}"
+                "AttentionPooling expected "
+                "[B,T,D], received "
+                f"{tuple(x.shape)}"
             )
 
-        scores = self.score(
-            x
-        ).squeeze(
-            -1
+        scores = (
+            self.score(
+                x
+            )
+            .squeeze(-1)
         )
 
         weights = torch.softmax(
@@ -653,10 +523,7 @@ class AttentionPooling(
 
         pooled = torch.sum(
             x
-            *
-            weights.unsqueeze(
-                -1
-            ),
+            * weights.unsqueeze(-1),
             dim=1
         )
 
@@ -666,9 +533,9 @@ class AttentionPooling(
         )
 
 
-# ==================================================================================================
-# 15. MODEL-09 ARCHITECTURE
-# ==================================================================================================
+# =============================================================================
+# 12. MODEL-09
+# =============================================================================
 
 class BidirectionalAttentionTransformerEncoder(
     nn.Module
@@ -709,7 +576,6 @@ class BidirectionalAttentionTransformerEncoder(
                 max_tokens,
                 model_dim
             )
-
         )
 
         nn.init.normal_(
@@ -720,16 +586,14 @@ class BidirectionalAttentionTransformerEncoder(
         self.local_attention = (
             LocalAttentionBlock(
                 dim=model_dim,
-                heads=heads,
-                dropout=ATTENTION_DROPOUT
+                heads=heads
             )
         )
 
         self.global_attention = (
             GlobalAttentionBlock(
                 dim=model_dim,
-                heads=heads,
-                dropout=ATTENTION_DROPOUT
+                heads=heads
             )
         )
 
@@ -766,28 +630,26 @@ class BidirectionalAttentionTransformerEncoder(
         training_noise=False
     ):
 
-        # ------------------------------------------------------------------------------------------
-        # MODEL-09 INPUT CONTRACT
+        # ---------------------------------------------------------
+        # REQUIRED INPUT:
         #
-        # x:
-        #   [batch, 91, 2560]
-        #
-        # Absolutely no 4-D tensor is allowed.
-        # ------------------------------------------------------------------------------------------
+        # [B, 91, 2560]
+        # ---------------------------------------------------------
 
-        if x.dim() != 3:
+        if x.ndim != 3:
 
             raise RuntimeError(
-                "MODEL-09 expected input shape "
+                "MODEL-09 expected a 3-D input tensor "
                 "[batch, tokens, features]. "
-                f"Received {tuple(x.shape)}"
+                f"Received {x.ndim}-D tensor with shape "
+                f"{tuple(x.shape)}."
             )
 
         if x.size(-1) != INPUT_DIM:
 
             raise RuntimeError(
-                f"MODEL-09 expected input feature dimension "
-                f"{INPUT_DIM}, received {x.size(-1)}"
+                "MODEL-09 expected input dimension "
+                f"{INPUT_DIM}, received {x.size(-1)}."
             )
 
         x = self.input_projection(
@@ -804,8 +666,7 @@ class BidirectionalAttentionTransformerEncoder(
                 x
                 +
                 torch.randn_like(x)
-                *
-                REPRESENTATION_NOISE
+                * REPRESENTATION_NOISE
             )
 
         T = x.size(1)
@@ -813,8 +674,8 @@ class BidirectionalAttentionTransformerEncoder(
         if T > TOKEN_LENGTH:
 
             raise RuntimeError(
-                f"MODEL-09 received {T} tokens, "
-                f"maximum is {TOKEN_LENGTH}"
+                f"Input contains {T} tokens, but MODEL-09 "
+                f"supports at most {TOKEN_LENGTH}."
             )
 
         x = (
@@ -841,10 +702,11 @@ class BidirectionalAttentionTransformerEncoder(
             )
         )
 
-        logits = self.classifier(
-            pooled
-        ).squeeze(
-            -1
+        logits = (
+            self.classifier(
+                pooled
+            )
+            .squeeze(-1)
         )
 
         return (
@@ -853,90 +715,230 @@ class BidirectionalAttentionTransformerEncoder(
         )
 
 
-# ==================================================================================================
-# 16. LOAD MODEL CHECKPOINT
-# ==================================================================================================
+# =============================================================================
+# 13. CHECKPOINT STATE-DICT EXTRACTION
+# =============================================================================
 
-@st.cache_resource
+def extract_state_dict(
+    checkpoint
+):
+
+    if isinstance(
+        checkpoint,
+        dict
+    ):
+
+        if (
+            "model_state_dict"
+            in checkpoint
+        ):
+
+            return checkpoint[
+                "model_state_dict"
+            ]
+
+        if (
+            "state_dict"
+            in checkpoint
+        ):
+
+            return checkpoint[
+                "state_dict"
+            ]
+
+    if isinstance(
+        checkpoint,
+        dict
+    ):
+
+        # A raw state_dict is also a dictionary.
+        tensor_values = [
+
+            isinstance(
+                value,
+                torch.Tensor
+            )
+
+            for value in checkpoint.values()
+
+        ]
+
+        if (
+            len(tensor_values) > 0
+            and all(tensor_values)
+        ):
+
+            return checkpoint
+
+    raise RuntimeError(
+        "Could not locate model state_dict inside checkpoint."
+    )
+
+
+# =============================================================================
+# 14. MODEL-09 CHECKPOINT VERIFICATION
+# =============================================================================
+
+def verify_checkpoint_architecture(
+    state_dict
+):
+
+    expected_keys = [
+
+        "local_attention.norm1.weight",
+        "local_attention.norm1.bias",
+        "local_attention.norm2.weight",
+        "local_attention.norm2.bias",
+
+        "local_attention.ff.0.weight",
+        "local_attention.ff.0.bias",
+        "local_attention.ff.3.weight",
+        "local_attention.ff.3.bias",
+
+        "global_attention.norm1.weight",
+        "global_attention.norm1.bias",
+        "global_attention.norm2.weight",
+        "global_attention.norm2.bias",
+
+        "global_attention.ff.0.weight",
+        "global_attention.ff.0.bias",
+        "global_attention.ff.3.weight",
+        "global_attention.ff.3.bias"
+    ]
+
+    missing = [
+
+        key
+        for key in expected_keys
+        if key not in state_dict
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            "Checkpoint architecture does not match the "
+            "current MODEL-09 deployment architecture.\n\n"
+            "Missing checkpoint keys:\n"
+            + "\n".join(missing)
+        )
+
+    # Verify FF dimension directly.
+
+    ff_weight = state_dict[
+        "local_attention.ff.0.weight"
+    ]
+
+    if tuple(
+        ff_weight.shape
+    ) != (
+        FF_DIM,
+        MODEL_DIM
+    ):
+
+        raise RuntimeError(
+            "Unexpected MODEL-09 feed-forward dimension.\n"
+            f"Checkpoint shape: {tuple(ff_weight.shape)}\n"
+            f"Expected: ({FF_DIM}, {MODEL_DIM})"
+        )
+
+
+# =============================================================================
+# 15. LOAD MODEL
+# =============================================================================
+
+@st.cache_resource(show_spinner=True)
 def load_model():
+
+    verify_artifacts()
+
+    checkpoint = torch.load(
+        MODEL_CHECKPOINT,
+        map_location="cpu",
+        weights_only=False
+    )
+
+    state_dict = extract_state_dict(
+        checkpoint
+    )
+
+    verify_checkpoint_architecture(
+        state_dict
+    )
 
     model = (
         BidirectionalAttentionTransformerEncoder()
     )
 
-    checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location="cpu",
-        weights_only=False
+    model.load_state_dict(
+        state_dict,
+        strict=True
     )
 
-    if isinstance(
-        checkpoint,
-        dict
-    ) and "model_state_dict" in checkpoint:
-
-        state_dict = (
-            checkpoint[
-                "model_state_dict"
-            ]
-        )
-
-    else:
-
-        state_dict = checkpoint
-
-    # Remove DataParallel prefix if present.
-
-    cleaned_state_dict = {}
-
-    for key, value in state_dict.items():
-
-        if key.startswith(
-            "module."
-        ):
-
-            key = key[
-                len("module.") :
-            ]
-
-        cleaned_state_dict[
-            key
-        ] = value
-
-    model.load_state_dict(
-        cleaned_state_dict,
-        strict=True
+    model = model.to(
+        DEVICE
     )
 
     model.eval()
 
-    model.to(
-        DEVICE
+    # -------------------------------------------------------------------------
+    # Parameter-count verification
+    # -------------------------------------------------------------------------
+
+    parameter_count = sum(
+        parameter.numel()
+        for parameter
+        in model.parameters()
     )
+
+    expected_parameter_count = 418882
+
+    if parameter_count != (
+        expected_parameter_count
+    ):
+
+        raise RuntimeError(
+            "MODEL-09 parameter-count mismatch.\n"
+            f"Loaded model: {parameter_count:,}\n"
+            f"Expected: {expected_parameter_count:,}"
+        )
 
     return model
 
 
-# ==================================================================================================
-# 17. LOAD ESM-2
-# ==================================================================================================
+# =============================================================================
+# 16. ESM-2 MODEL LOADING
+# =============================================================================
 
-@st.cache_resource
-def load_esm():
+@st.cache_resource(show_spinner=True)
+def load_esm2():
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        ESM_MODEL_NAME
+    if (
+        AutoTokenizer is None
+        or EsmModel is None
+    ):
+
+        raise RuntimeError(
+            "transformers could not be imported.\n\n"
+            f"Original error: {TRANSFORMERS_IMPORT_ERROR}"
+        )
+
+    tokenizer = (
+        AutoTokenizer.from_pretrained(
+            ESM_MODEL_NAME
+        )
     )
 
-    esm_model = EsmModel.from_pretrained(
-        ESM_MODEL_NAME
+    esm_model = (
+        EsmModel.from_pretrained(
+            ESM_MODEL_NAME
+        )
+    )
+
+    esm_model = esm_model.to(
+        DEVICE
     )
 
     esm_model.eval()
-
-    esm_model.to(
-        DEVICE
-    )
 
     return (
         tokenizer,
@@ -944,29 +946,16 @@ def load_esm():
     )
 
 
-# ==================================================================================================
-# 18. SAFE PROTEIN NORMALIZATION
-# ==================================================================================================
-
-# Standard ESM-2 amino-acid alphabet.
-#
-# IMPORTANT:
-# X is deliberately accepted.
-#
-# This prevents the previous:
-#
-# "Invalid amino-acid characters found: X"
-#
-# error.
-#
-# We do NOT silently replace X with another amino acid.
+# =============================================================================
+# 17. PROTEIN SEQUENCE CLEANING / VALIDATION
+# =============================================================================
 
 ALLOWED_AMINO_ACIDS = set(
-    "ACDEFGHIKLMNPQRSTVWYX"
+    "ACDEFGHIKLMNPQRSTVWY"
 )
 
 
-def normalize_protein_sequence(
+def clean_sequence(
     sequence
 ):
 
@@ -980,7 +969,7 @@ def normalize_protein_sequence(
         sequence
     )
 
-    # Remove FASTA header lines.
+    # Remove FASTA header if present.
 
     lines = (
         sequence
@@ -994,9 +983,11 @@ def normalize_protein_sequence(
         line = line.strip()
 
         if not line:
+
             continue
 
         if line.startswith(">"):
+
             continue
 
         cleaned_lines.append(
@@ -1017,7 +1008,7 @@ def normalize_protein_sequence(
 
     sequence = sequence.upper()
 
-    if len(sequence) == 0:
+    if not sequence:
 
         raise ValueError(
             "Protein sequence is empty."
@@ -1033,338 +1024,343 @@ def normalize_protein_sequence(
 
         raise ValueError(
             "Invalid amino-acid characters found: "
-            +
-            ", ".join(invalid)
-            +
-            "\n\nAllowed amino acids:\n"
-            +
-            "ACDEFGHIKLMNPQRSTVWYX"
+            + ", ".join(invalid)
+            + "\n\nAllowed amino acids:\n"
+            + "".join(
+                sorted(
+                    ALLOWED_AMINO_ACIDS
+                )
+            )
+            + "\n\n"
+            "Important: X represents an unknown residue and "
+            "is not accepted by this deployment because the "
+            "benchmark ESM-2 representation was constructed "
+            "from valid amino-acid sequences."
         )
 
     return sequence
 
 
-# ==================================================================================================
-# 19. ESM-2 RESIDUE EMBEDDING
-# ==================================================================================================
+# =============================================================================
+# 18. ESM-2 RESIDUE EMBEDDING
+# =============================================================================
 
-@torch.inference_mode()
-def get_residue_embeddings(
+def extract_residue_embeddings(
     sequence,
     tokenizer,
     esm_model
 ):
 
-    encoded = tokenizer(
-        sequence,
-        return_tensors="pt",
-        add_special_tokens=True
-    )
-
-    encoded = {
-        key: value.to(
-            DEVICE
-        )
-        for key, value
-        in encoded.items()
-    }
-
-    outputs = esm_model(
-        **encoded
-    )
-
-    hidden = (
-        outputs.last_hidden_state
-    )
-
-    # ESM-2 output includes special tokens.
+    # ESM-2 has a practical sequence-length limitation.
     #
-    # For a single sequence:
+    # For long HIV-1 proteins, process the sequence in overlapping
+    # windows and reconstruct residue embeddings.
     #
-    # [1, sequence_length + special_tokens, 1280]
-    #
-    # Remove BOS and EOS where present.
+    # This mirrors the benchmark's long-protein strategy.
 
-    if hidden.dim() != 3:
+    MAX_ESM_LENGTH = 1022
 
-        raise RuntimeError(
-            "Unexpected ESM-2 hidden-state shape: "
-            f"{tuple(hidden.shape)}"
-        )
+    OVERLAP = 128
 
-    residue_embeddings = (
-        hidden[
-            0,
-            1:-1,
-            :
-        ]
+    STRIDE = (
+        MAX_ESM_LENGTH
+        -
+        OVERLAP
     )
 
-    # Expected:
-    #
-    # [residues, 1280]
-
-    if residue_embeddings.dim() != 2:
-
-        raise RuntimeError(
-            "Residue embedding tensor must be 2-D. "
-            f"Received {tuple(residue_embeddings.shape)}"
-        )
-
-    if residue_embeddings.size(
-        -1
-    ) != ESM2_DIMENSION:
-
-        raise RuntimeError(
-            "Unexpected ESM-2 dimension: "
-            f"{residue_embeddings.size(-1)}"
-        )
-
-    return (
-        residue_embeddings
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(
-            np.float32
-        )
+    sequence_length = len(
+        sequence
     )
 
-
-# ==================================================================================================
-# 20. RESIDUE → 2560-D TOKENS
-# ==================================================================================================
-
-def residue_embeddings_to_tokens(
-    residue_embeddings
-):
-
-    residue_embeddings = np.asarray(
-        residue_embeddings,
+    accumulated = np.zeros(
+        (
+            sequence_length,
+            ESM2_DIMENSION
+        ),
         dtype=np.float32
     )
+
+    counts = np.zeros(
+        sequence_length,
+        dtype=np.float32
+    )
+
+    start = 0
+
+    while start < sequence_length:
+
+        end = min(
+            start
+            + MAX_ESM_LENGTH,
+            sequence_length
+        )
+
+        fragment = sequence[
+            start:end
+        ]
+
+        inputs = tokenizer(
+            fragment,
+            return_tensors="pt",
+            add_special_tokens=True
+        )
+
+        inputs = {
+            key: value.to(
+                DEVICE
+            )
+            for key, value
+            in inputs.items()
+        }
+
+        with torch.no_grad():
+
+            outputs = esm_model(
+                **inputs
+            )
+
+        hidden = (
+            outputs
+            .last_hidden_state
+        )
+
+        # Remove BOS and EOS.
+
+        residue_hidden = (
+            hidden[
+                0,
+                1:-1,
+                :
+            ]
+        )
+
+        residue_hidden = (
+            residue_hidden
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(
+                np.float32
+            )
+        )
+
+        expected_length = (
+            end
+            - start
+        )
+
+        if residue_hidden.shape[0] != (
+            expected_length
+        ):
+
+            raise RuntimeError(
+                "ESM-2 residue count mismatch.\n"
+                f"Expected: {expected_length}\n"
+                f"Received: {residue_hidden.shape[0]}"
+            )
+
+        accumulated[
+            start:end
+        ] += residue_hidden
+
+        counts[
+            start:end
+        ] += 1.0
+
+        if end >= sequence_length:
+
+            break
+
+        start += STRIDE
+
+    if np.any(
+        counts == 0
+    ):
+
+        raise RuntimeError(
+            "Some residues did not receive an ESM-2 embedding."
+        )
+
+    accumulated /= (
+        counts[:, None]
+    )
+
+    return accumulated
+
+
+# =============================================================================
+# 19. RESIDUE → 2560-D COMPLETE 48-AA TOKENS
+# =============================================================================
+
+def residue_to_tokens(
+    residue_embeddings
+):
 
     if residue_embeddings.ndim != 2:
 
         raise ValueError(
-            "Residue embeddings must have shape "
-            "[residues, 1280]. "
-            f"Received {residue_embeddings.shape}"
+            "Residue embeddings must be 2-D "
+            "[residues, 1280]. Received "
+            f"{residue_embeddings.shape}"
         )
 
-    if residue_embeddings.shape[
-        1
-    ] != ESM2_DIMENSION:
-
-        raise ValueError(
-            f"Expected ESM-2 dimension "
-            f"{ESM2_DIMENSION}; "
-            f"received {residue_embeddings.shape[1]}"
-        )
-
-    residue_count = (
-        residue_embeddings.shape[0]
-    )
-
-    # COMPLETE chunks only.
-    #
-    # No partial chunk is included.
-
-    if residue_count < CHUNK_SIZE:
-
-        raise ValueError(
-            f"Protein contains only {residue_count} residues. "
-            f"At least {CHUNK_SIZE} residues are required."
-        )
-
-    n_complete_tokens = (
-        residue_count
-        // CHUNK_STRIDE
-    )
-
-    n_complete_tokens = min(
-        n_complete_tokens,
-        TOKEN_LENGTH
-    )
-
-    tokens = []
-
-    for token_index in range(
-        n_complete_tokens
+    if residue_embeddings.shape[1] != (
+        ESM2_DIMENSION
     ):
 
-        start = (
-            token_index
-            *
-            CHUNK_STRIDE
+        raise ValueError(
+            "Expected residue embedding dimension "
+            f"{ESM2_DIMENSION}, received "
+            f"{residue_embeddings.shape[1]}"
         )
 
-        end = (
-            start
-            +
-            CHUNK_SIZE
-        )
+    number_of_complete_tokens = (
+        residue_embeddings.shape[0]
+        //
+        CHUNK_SIZE
+    )
 
-        if end > residue_count:
-
-            break
-
-        chunk = (
-            residue_embeddings[
-                start:end,
-                :
-            ]
-        )
-
-        # ------------------------------------------------------------------------------------------
-        # Current benchmark representation:
-        #
-        # mean pooling + max pooling
-        #
-        # 1280 + 1280 = 2560
-        # ------------------------------------------------------------------------------------------
-
-        mean_vector = np.mean(
-            chunk,
-            axis=0
-        )
-
-        max_vector = np.max(
-            chunk,
-            axis=0
-        )
-
-        token = np.concatenate(
-            [
-                mean_vector,
-                max_vector
-            ],
-            axis=0
-        )
-
-        tokens.append(
-            token
-        )
-
-    if not tokens:
+    if number_of_complete_tokens < 1:
 
         raise ValueError(
-            "No complete 48-aa tokens could be constructed."
+            f"Protein is too short. At least "
+            f"{CHUNK_SIZE} residues are required."
         )
 
-    tokens = np.stack(
-        tokens
-    ).astype(
+    usable_length = (
+        number_of_complete_tokens
+        *
+        CHUNK_SIZE
+    )
+
+    residues = (
+        residue_embeddings[
+            :usable_length
+        ]
+    )
+
+    chunks = (
+        residues
+        .reshape(
+            number_of_complete_tokens,
+            CHUNK_SIZE,
+            ESM2_DIMENSION
+        )
+    )
+
+    mean_features = (
+        chunks.mean(
+            axis=1
+        )
+    )
+
+    max_features = (
+        chunks.max(
+            axis=1
+        )
+    )
+
+    tokens = np.concatenate(
+        [
+            mean_features,
+            max_features
+        ],
+        axis=1
+    )
+
+    if tokens.shape[1] != (
+        INPUT_DIM
+    ):
+
+        raise RuntimeError(
+            "Token dimension mismatch.\n"
+            f"Received: {tokens.shape[1]}\n"
+            f"Expected: {INPUT_DIM}"
+        )
+
+    return tokens.astype(
         np.float32
     )
 
-    if tokens.shape[
-        1
-    ] != INPUT_DIM:
 
-        raise RuntimeError(
-            "Token feature dimension mismatch. "
-            f"Expected {INPUT_DIM}; "
-            f"received {tokens.shape[1]}"
-        )
+# =============================================================================
+# 20. PAD / TRUNCATE TO 91 TOKENS
+# =============================================================================
 
-    return tokens
-
-
-# ==================================================================================================
-# 21. PAD / TRUNCATE TO 91 TOKENS
-# ==================================================================================================
-
-def pad_or_truncate_tokens(
+def pad_tokens(
     tokens
 ):
-
-    tokens = np.asarray(
-        tokens,
-        dtype=np.float32
-    )
 
     if tokens.ndim != 2:
 
         raise ValueError(
-            "Token matrix must be 2-D "
-            "[tokens, 2560]. "
-            f"Received {tokens.shape}"
+            "Tokens must be 2-D [tokens, 2560]."
         )
 
-    if tokens.shape[
-        1
-    ] != INPUT_DIM:
-
-        raise ValueError(
-            f"Expected {INPUT_DIM} token features; "
-            f"received {tokens.shape[1]}"
-        )
-
-    n_tokens = (
-        tokens.shape[0]
-    )
-
-    if n_tokens >= TOKEN_LENGTH:
-
-        final_tokens = (
-            tokens[
-                :TOKEN_LENGTH,
-                :
-            ]
-        )
-
-    else:
-
-        final_tokens = np.zeros(
-            (
-                TOKEN_LENGTH,
-                INPUT_DIM
-            ),
-            dtype=np.float32
-        )
-
-        final_tokens[
-            :n_tokens,
-            :
-        ] = tokens
-
-    return final_tokens
-
-
-# ==================================================================================================
-# 22. APPLY BENCHMARK TRAIN-ONLY STANDARDIZATION
-# ==================================================================================================
-
-def standardize_benchmark_tokens(
-    tokens
-):
-
-    tokens = np.asarray(
-        tokens,
-        dtype=np.float32
-    )
-
-    if tokens.shape != (
-        TOKEN_LENGTH,
+    if tokens.shape[1] != (
         INPUT_DIM
     ):
 
         raise ValueError(
-            "Expected benchmark token matrix "
-            f"({TOKEN_LENGTH}, {INPUT_DIM}); "
-            f"received {tokens.shape}"
+            f"Expected token dimension {INPUT_DIM}."
         )
+
+    number_of_tokens = (
+        tokens.shape[0]
+    )
+
+    if number_of_tokens > (
+        TOKEN_LENGTH
+    ):
+
+        # The benchmark representation is fixed to 91 tokens.
+        #
+        # For deployment, retain the first 91 complete tokens.
+
+        tokens = tokens[
+            :TOKEN_LENGTH
+        ]
+
+        number_of_tokens = (
+            TOKEN_LENGTH
+        )
+
+    output = np.zeros(
+        (
+            TOKEN_LENGTH,
+            INPUT_DIM
+        ),
+        dtype=np.float32
+    )
+
+    output[
+        :number_of_tokens
+    ] = tokens
+
+    return output
+
+
+# =============================================================================
+# 21. TRAIN-ONLY STANDARDIZATION
+# =============================================================================
+
+def standardize_tokens(
+    tokens,
+    train_mean,
+    train_std
+):
 
     standardized = (
         tokens
         -
-        TRAIN_MEAN
-    ) / TRAIN_STD
+        train_mean
+    ) / train_std
 
-    standardized = np.asarray(
-        standardized,
-        dtype=np.float32
+    standardized = (
+        np.asarray(
+            standardized,
+            dtype=np.float32
+        )
     )
 
     if not np.all(
@@ -1374,321 +1370,277 @@ def standardize_benchmark_tokens(
     ):
 
         raise RuntimeError(
-            "Standardized MODEL-09 input contains "
-            "NaN or infinite values."
+            "Standardized deployment representation "
+            "contains non-finite values."
         )
 
     return standardized
 
 
-# ==================================================================================================
-# 23. CRITICAL MODEL INPUT SHAPE FUNCTION
-# ==================================================================================================
+# =============================================================================
+# 22. FIXED-SHAPE MODEL INPUT
+#
+# IMPORTANT:
+# This explicitly creates:
+#
+# [91, 2560]
+#       ↓
+# [1, 91, 2560]
+#
+# and NEVER:
+#
+# [1, 1, 91, 2560]
+#
+# This fixes the previous 4-D MultiheadAttention error.
+# =============================================================================
 
-def prepare_model_input(
+def create_model_input(
     standardized_tokens
 ):
 
-    x = np.asarray(
+    array = np.asarray(
         standardized_tokens,
         dtype=np.float32
     )
 
-    # ----------------------------------------------------------------------------------------------
-    # REQUIRED UNBATCHED REPRESENTATION:
-    #
-    # [91, 2560]
-    # ----------------------------------------------------------------------------------------------
-
-    if x.shape != (
+    if array.shape != (
         TOKEN_LENGTH,
         INPUT_DIM
     ):
 
         raise RuntimeError(
-            "Expected unbatched MODEL-09 representation "
-            f"({TOKEN_LENGTH}, {INPUT_DIM}); "
-            f"received {x.shape}"
-        )
-
-    # ----------------------------------------------------------------------------------------------
-    # ADD EXACTLY ONE BATCH DIMENSION:
-    #
-    # [91, 2560]
-    #       ↓
-    # [1, 91, 2560]
-    #
-    # This is the shape MultiheadAttention expects.
-    # ----------------------------------------------------------------------------------------------
-
-    x = np.expand_dims(
-        x,
-        axis=0
-    )
-
-    if x.shape != (
-        1,
-        TOKEN_LENGTH,
-        INPUT_DIM
-    ):
-
-        raise RuntimeError(
-            "MODEL-09 batch construction produced "
-            f"incorrect shape: {x.shape}"
+            "Deployment representation has wrong shape.\n"
+            f"Received: {array.shape}\n"
+            f"Expected: ({TOKEN_LENGTH}, {INPUT_DIM})"
         )
 
     tensor = torch.from_numpy(
-        x
-    ).to(
-        DEVICE
+        array
     )
 
-    if tensor.dim() != 3:
+    # Exactly ONE batch dimension.
+
+    tensor = tensor.unsqueeze(
+        0
+    )
+
+    if tensor.ndim != 3:
 
         raise RuntimeError(
-            "CRITICAL: MODEL-09 tensor must be 3-D. "
-            f"Received {tensor.dim()}-D tensor."
+            "MODEL-09 input construction failed.\n"
+            f"Received tensor shape: {tuple(tensor.shape)}"
         )
 
-    return tensor
-
-
-# ==================================================================================================
-# 24. COMPLETE MODEL-09 PREDICTION
-# ==================================================================================================
-
-@torch.inference_mode()
-def predict_model09(
-    model,
-    sequence,
-    tokenizer,
-    esm_model
-):
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 1 — NORMALIZE / VALIDATE
-    # ----------------------------------------------------------------------------------------------
-
-    sequence = normalize_protein_sequence(
-        sequence
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 2 — ESM-2
-    # ----------------------------------------------------------------------------------------------
-
-    residue_embeddings = (
-        get_residue_embeddings(
-            sequence,
-            tokenizer,
-            esm_model
-        )
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 3 — RESIDUE → TOKENS
-    # ----------------------------------------------------------------------------------------------
-
-    raw_tokens = (
-        residue_embeddings_to_tokens(
-            residue_embeddings
-        )
-    )
-
-    raw_token_count = (
-        raw_tokens.shape[0]
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 4 — 91 TOKENS
-    # ----------------------------------------------------------------------------------------------
-
-    tokens = (
-        pad_or_truncate_tokens(
-            raw_tokens
-        )
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 5 — TRAIN-ONLY STANDARDIZATION
-    # ----------------------------------------------------------------------------------------------
-
-    standardized_tokens = (
-        standardize_benchmark_tokens(
-            tokens
-        )
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 6 — EXACT MODEL INPUT
-    #
-    # [1, 91, 2560]
-    # ----------------------------------------------------------------------------------------------
-
-    model_input = (
-        prepare_model_input(
-            standardized_tokens
-        )
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # FINAL SHAPE ASSERTION
-    # ----------------------------------------------------------------------------------------------
-
-    assert model_input.dim() == 3
-
-    assert model_input.shape == (
+    if tensor.shape != (
         1,
         TOKEN_LENGTH,
         INPUT_DIM
-    )
-
-    # ----------------------------------------------------------------------------------------------
-    # STEP 7 — MODEL-09
-    # ----------------------------------------------------------------------------------------------
-
-    logits, attention = model(
-        model_input,
-        training_noise=False
-    )
-
-    if logits.dim() != 1:
+    ):
 
         raise RuntimeError(
-            "Unexpected MODEL-09 logits shape: "
-            f"{tuple(logits.shape)}"
+            "Unexpected MODEL-09 input shape.\n"
+            f"Received: {tuple(tensor.shape)}\n"
+            f"Expected: (1, {TOKEN_LENGTH}, {INPUT_DIM})"
         )
 
-    probability = (
-        torch.sigmoid(
-            logits
-        )[0]
-        .detach()
-        .cpu()
-        .item()
+    return tensor.to(
+        DEVICE
     )
+
+
+# =============================================================================
+# 23. FULL MODEL-09 PREDICTION
+# =============================================================================
+
+def predict_model09(
+    model,
+    sequence,
+    train_mean,
+    train_std,
+    frozen_threshold
+):
+
+    sequence = clean_sequence(
+        sequence
+    )
+
+    # -------------------------------------------------------------------------
+    # ESM-2
+    # -------------------------------------------------------------------------
+
+    tokenizer, esm_model = (
+        load_esm2()
+    )
+
+    with st.spinner(
+        "Extracting ESM-2 residue embeddings..."
+    ):
+
+        residue_embeddings = (
+            extract_residue_embeddings(
+                sequence,
+                tokenizer,
+                esm_model
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Tokenization
+    # -------------------------------------------------------------------------
+
+    with st.spinner(
+        "Constructing 48-residue tokens..."
+    ):
+
+        raw_tokens = (
+            residue_to_tokens(
+                residue_embeddings
+            )
+        )
+
+        token_matrix = (
+            pad_tokens(
+                raw_tokens
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Standardization
+    # -------------------------------------------------------------------------
+
+    standardized = (
+        standardize_tokens(
+            token_matrix,
+            train_mean,
+            train_std
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # MODEL INPUT
+    # -------------------------------------------------------------------------
+
+    model_input = (
+        create_model_input(
+            standardized
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # MODEL-09
+    # -------------------------------------------------------------------------
+
+    with torch.no_grad():
+
+        logits, attention = (
+            model(
+                model_input,
+                training_noise=False
+            )
+        )
+
+        probability = (
+            torch.sigmoid(
+                logits
+            )
+            .detach()
+            .cpu()
+            .item()
+        )
 
     prediction = int(
         probability
-        >=
-        FROZEN_THRESHOLD
+        >= frozen_threshold
     )
 
     return {
-
-        "sequence": sequence,
 
         "sequence_length":
             len(sequence),
 
         "raw_token_count":
-            raw_token_count,
+            raw_tokens.shape[0],
 
         "final_token_count":
             TOKEN_LENGTH,
+
+        "residue_shape":
+            residue_embeddings.shape,
+
+        "token_shape":
+            token_matrix.shape,
+
+        "model_input_shape":
+            tuple(
+                model_input.shape
+            ),
 
         "probability":
             probability,
 
         "threshold":
-            FROZEN_THRESHOLD,
+            frozen_threshold,
 
         "prediction":
             prediction,
 
-        "label":
-            (
-                "RECOMBINANT"
-                if prediction == 1
-                else
-                "NON-RECOMBINANT"
-            ),
-
         "attention":
-            attention[
-                0
-            ]
+            attention
             .detach()
             .cpu()
             .numpy()
-
+            .reshape(-1)
     }
 
 
-# ==================================================================================================
-# 25. LOAD DEPLOYMENT MODELS
-# ==================================================================================================
+# =============================================================================
+# 24. STARTUP INITIALIZATION
+# =============================================================================
 
 try:
+
+    verify_artifacts()
+
+    train_mean, train_std = (
+        load_standardization()
+    )
+
+    FROZEN_THRESHOLD = (
+        load_frozen_threshold()
+    )
 
     model = load_model()
 
-except Exception as exc:
-
-    st.error(
-        "MODEL-09 could not be initialized from the checkpoint."
+    st.success(
+        "✓ MODEL-09 initialized successfully"
     )
 
-    st.exception(exc)
+except Exception as e:
+
+    st.error(
+        "MODEL-09 could not be initialized."
+    )
+
+    st.code(
+        str(e),
+        language="text"
+    )
 
     st.stop()
 
 
-# ==================================================================================================
-# 26. LOAD ESM-2
-# ==================================================================================================
+# =============================================================================
+# 25. SIDEBAR — DEPLOYMENT INFORMATION
+# =============================================================================
 
-try:
+with st.sidebar:
 
-    tokenizer, esm_model = load_esm()
-
-except Exception as exc:
-
-    st.error(
-        "ESM-2 could not be initialized."
-    )
-
-    st.exception(exc)
-
-    st.stop()
-
-
-# ==================================================================================================
-# 27. HEADER
-# ==================================================================================================
-
-st.title(
-    "🧬 MODEL-09 HIV-1 Recombinant Classifier"
-)
-
-st.caption(
-    "Current 9-model benchmark deployment"
-)
-
-
-# ==================================================================================================
-# 28. DEPLOYMENT STATUS
-# ==================================================================================================
-
-with st.expander(
-    "Deployment configuration",
-    expanded=False
-):
-
-    st.write(
-        f"**Repository root:** `{PROJECT_ROOT}`"
-    )
-
-    st.write(
-        f"**Artifacts:** `{ARTIFACT_DIR}`"
+    st.header(
+        "Deployment"
     )
 
     st.write(
         f"**Device:** `{DEVICE}`"
-    )
-
-    st.write(
-        f"**ESM-2:** `{ESM_MODEL_NAME}`"
     )
 
     st.write(
@@ -1700,10 +1652,6 @@ with st.expander(
     )
 
     st.write(
-        f"**Chunk stride:** `{CHUNK_STRIDE}`"
-    )
-
-    st.write(
         f"**Token dimension:** `{INPUT_DIM}`"
     )
 
@@ -1712,116 +1660,87 @@ with st.expander(
     )
 
     st.write(
-        f"**Frozen threshold:** `{FROZEN_THRESHOLD:.10f}`"
+        f"**MODEL dimension:** `{MODEL_DIM}`"
     )
 
     st.write(
-        f"**Checkpoint:** `{CHECKPOINT_PATH}`"
+        f"**Attention heads:** `{ATTENTION_HEADS}`"
     )
 
-    st.success(
-        "✓ MODEL-09 deployment artifacts loaded"
+    st.write(
+        f"**FF dimension:** `{FF_DIM}`"
+    )
+
+    st.write(
+        f"**Frozen threshold:** `{FROZEN_THRESHOLD:.10f}`"
+    )
+
+    st.divider()
+
+    st.caption(
+        "Current 9-model benchmark"
     )
 
 
-# ==================================================================================================
-# 29. INPUT
-# ==================================================================================================
+# =============================================================================
+# 26. INPUT
+# =============================================================================
 
 st.subheader(
-    "Enter HIV-1 protein sequence"
+    "Protein sequence"
 )
 
 sequence_input = st.text_area(
 
-    "Protein sequence",
+    "Paste an HIV-1 protein sequence",
 
     height=220,
 
     placeholder=(
-        "Paste an amino-acid sequence here..."
-    ),
-
-    help=(
-        "Standard amino acids plus X are accepted. "
-        "FASTA headers are also accepted."
+        "Example:\n"
+        "MRVMGTQKNYSLLWRWGIMIFGILMACSANNLWVTVYYGVPVW..."
     )
 )
 
 
-# ==================================================================================================
-# 30. EXAMPLE
-# ==================================================================================================
-
-with st.expander(
-    "Example input"
-):
-
-    st.code(
-        "MRVMGTQKNYSLLWRWGIMIFGILMACSANNLWVTVYYGVPVWKEAETTLFCASDAKAQDPEVHNVWATHACVPTDPSP"
-    )
-
-
-# ==================================================================================================
-# 31. PREDICT BUTTON
-# ==================================================================================================
+# =============================================================================
+# 27. PREDICTION BUTTON
+# =============================================================================
 
 predict_button = st.button(
-    "🔬 Predict recombinant status",
+    "🧬 Predict recombinant status",
     type="primary",
     use_container_width=True
 )
 
 
-# ==================================================================================================
-# 32. PREDICTION
-# ==================================================================================================
+# =============================================================================
+# 28. RUN PREDICTION
+# =============================================================================
 
 if predict_button:
 
-    if not sequence_input.strip():
-
-        st.warning(
-            "Please enter a protein sequence."
-        )
-
-        st.stop()
-
     try:
 
-        start_time = time.time()
+        result = predict_model09(
 
-        with st.spinner(
-            "Running ESM-2 and MODEL-09..."
-        ):
+            model,
 
-            result = predict_model09(
+            sequence_input,
 
-                model,
+            train_mean,
 
-                sequence_input,
+            train_std,
 
-                tokenizer,
+            FROZEN_THRESHOLD
 
-                esm_model
-
-            )
-
-        elapsed = (
-            time.time()
-            -
-            start_time
-        )
-
-        st.success(
-            "Prediction completed."
         )
 
         st.divider()
 
-        # ------------------------------------------------------------------------------------------
-        # RESULT
-        # ------------------------------------------------------------------------------------------
+        st.subheader(
+            "MODEL-09 Prediction"
+        )
 
         if result[
             "prediction"
@@ -1837,13 +1756,15 @@ if predict_button:
                 "## NON-RECOMBINANT"
             )
 
-        # ------------------------------------------------------------------------------------------
-        # PROBABILITY
-        # ------------------------------------------------------------------------------------------
+        probability = (
+            result[
+                "probability"
+            ]
+        )
 
         st.metric(
             "Recombinant Probability",
-            f"{result['probability']:.8f}"
+            f"{probability:.8f}"
         )
 
         st.metric(
@@ -1851,189 +1772,74 @@ if predict_button:
             f"{result['threshold']:.8f}"
         )
 
-        # ------------------------------------------------------------------------------------------
-        # INPUT / TOKEN INFORMATION
-        # ------------------------------------------------------------------------------------------
-
-        col1, col2, col3 = st.columns(
-            3
+        st.write(
+            f"**Input sequence length:** "
+            f"{result['sequence_length']} residues"
         )
 
-        with col1:
-
-            st.metric(
-                "Protein Length",
-                f"{result['sequence_length']} aa"
-            )
-
-        with col2:
-
-            st.metric(
-                "Complete 48-aa Tokens",
-                result[
-                    "raw_token_count"
-                ]
-            )
-
-        with col3:
-
-            st.metric(
-                "MODEL-09 Tokens",
-                result[
-                    "final_token_count"
-                ]
-            )
-
-        st.caption(
-            f"Inference time: {elapsed:.2f} seconds"
+        st.write(
+            f"**Complete 48-aa tokens:** "
+            f"{result['raw_token_count']}"
         )
 
-        # ------------------------------------------------------------------------------------------
-        # PROBABILITY BAR
-        # ------------------------------------------------------------------------------------------
-
-        st.progress(
-            min(
-                max(
-                    result["probability"],
-                    0.0
-                ),
-                1.0
-            )
+        st.write(
+            f"**Final MODEL-09 representation:** "
+            f"{result['final_token_count']} × "
+            f"{INPUT_DIM}"
         )
 
-        # ------------------------------------------------------------------------------------------
-        # TECHNICAL DETAILS
-        # ------------------------------------------------------------------------------------------
+        st.write(
+            f"**MODEL-09 input tensor:** "
+            f"`{result['model_input_shape']}`"
+        )
 
-        with st.expander(
-            "Technical prediction details"
-        ):
+        # ---------------------------------------------------------------------
+        # Attention visualization
+        # ---------------------------------------------------------------------
 
-            st.write(
-                "### Current benchmark pipeline"
-            )
-
-            st.code(
-                "\n".join(
-                    [
-                        "RAW PROTEIN SEQUENCE",
-                        "↓",
-                        "ESM-2 t33 650M",
-                        "↓",
-                        "1280-D residue embeddings",
-                        "↓",
-                        "complete non-overlapping 48-aa chunks",
-                        "↓",
-                        "mean + max pooling",
-                        "↓",
-                        "2560-D tokens",
-                        "↓",
-                        "pad / truncate to 91 tokens",
-                        "↓",
-                        "benchmark TRAIN-ONLY standardization",
-                        "↓",
-                        "MODEL-09",
-                        "↓",
-                        "sigmoid probability",
-                        "↓",
-                        f"frozen threshold = {FROZEN_THRESHOLD:.10f}",
-                        "↓",
-                        "classification"
-                    ]
-                ),
-                language="text"
-            )
-
-            st.write(
-                f"**Input tensor shape:** "
-                f"`[1, {TOKEN_LENGTH}, {INPUT_DIM}]`"
-            )
-
-            st.write(
-                "**Attention tensor:** "
-                f"`[1, {TOKEN_LENGTH}, {MODEL_DIM}]`"
-            )
-
-            st.write(
-                "**X accepted:** Yes"
-            )
-
-            st.write(
-                "**Benchmark standardization:** "
-                "TRAIN ONLY"
-            )
-
-        # ------------------------------------------------------------------------------------------
-        # ATTENTION
-        # ------------------------------------------------------------------------------------------
+        st.subheader(
+            "Token attention"
+        )
 
         attention = result[
             "attention"
         ]
 
-        if (
-            attention is not None
-            and
-            len(attention) == TOKEN_LENGTH
-        ):
+        st.bar_chart(
+            attention
+        )
 
-            st.subheader(
-                "MODEL-09 attention over tokens"
-            )
-
-            st.bar_chart(
-                {
-                    "Attention":
-                        attention
-                }
-            )
-
-            st.caption(
-                "Attention weights correspond to the 91-token "
-                "MODEL-09 representation."
-            )
-
-    except ValueError as exc:
+    except ValueError as e:
 
         st.error(
             "Invalid protein sequence."
         )
 
         st.code(
-            str(exc),
+            str(e),
             language="text"
         )
 
-    except RuntimeError as exc:
-
-        st.error(
-            "MODEL-09 prediction failed."
-        )
-
-        st.code(
-            str(exc),
-            language="text"
-        )
-
-    except Exception as exc:
+    except Exception as e:
 
         st.error(
             "Prediction failed."
         )
 
-        st.exception(exc)
+        st.exception(
+            e
+        )
 
 
-# ==================================================================================================
-# 33. FOOTER
-# ==================================================================================================
+# =============================================================================
+# 29. FOOTER
+# =============================================================================
 
 st.divider()
 
 st.caption(
-    "MODEL-09 — Current 9-model benchmark | "
-    "ESM-2 650M → 48-aa complete chunks → "
-    "mean+max 2560-D tokens → 91 tokens → "
-    "train-only standardization → attention transformer"
+    "MODEL-09 | Current 9-model benchmark | "
+    "ESM-2 t33 650M → 48-aa mean+max tokens → "
+    "91-token representation → train-only standardization → "
+    "Bidirectional Attention Transformer Encoder"
 )

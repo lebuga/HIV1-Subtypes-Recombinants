@@ -31,13 +31,13 @@
 #     recombinant / non-recombinant
 #
 # CURRENT BENCHMARK:
-#     ESM dimension = 1280
-#     Chunk size    = 48
-#     Chunk stride  = 48
-#     Token dim     = 2560
-#     Token length  = 91
-#     Model dim     = 96
-#     Attention heads = 4
+#     ESM dimension       = 1280
+#     Chunk size          = 48
+#     Chunk stride        = 48
+#     Token dimension     = 2560
+#     Token length       = 91
+#     Model dimension    = 96
+#     Attention heads    = 4
 #
 # REQUIRED ARTIFACTS:
 #     MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt
@@ -46,8 +46,23 @@
 #     MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt
 #
 # IMPORTANT:
-#     The app searches recursively for artifacts so that files uploaded
-#     directly to GitHub or inside artifacts/ can both be discovered.
+#     Artifact files are searched recursively.
+#
+# CRITICAL FIX:
+#     Training mean/std are normalized to [1, 2560], NOT [1, 1, 2560].
+#
+#     Correct:
+#         tokens       = [91, 2560]
+#         train_mean   = [1, 2560]
+#         train_std    = [1, 2560]
+#         standardized = [91, 2560]
+#         model_input  = [1, 91, 2560]
+#
+#     Incorrect:
+#         tokens       = [91, 2560]
+#         train_mean   = [1, 1, 2560]
+#         standardized = [1, 91, 2560]
+#
 # ================================================================================================
 
 
@@ -56,9 +71,7 @@
 # ================================================================================================
 
 from pathlib import Path
-import os
 import re
-import sys
 import traceback
 
 import numpy as np
@@ -66,7 +79,6 @@ import streamlit as st
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ================================================================================================
@@ -84,7 +96,9 @@ st.set_page_config(
 # 3. CONSTANTS
 # ================================================================================================
 
-ESM_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
+ESM_MODEL_NAME = (
+    "facebook/esm2_t33_650M_UR50D"
+)
 
 ESM2_DIMENSION = 1280
 
@@ -102,10 +116,6 @@ ATTENTION_DROPOUT = 0.25
 
 REPRESENTATION_NOISE = 0.015
 
-ALLOWED_AMINO_ACIDS = set(
-    "ACDEFGHIKLMNPQRSTVWY"
-)
-
 CHECKPOINT_NAME = (
     "MODEL-09_Bidirectional_Attention_Transformer_Encoder.pt"
 )
@@ -122,6 +132,10 @@ THRESHOLD_NAME = (
     "MODEL-09_BENCHMARK_FROZEN_THRESHOLD.txt"
 )
 
+ALLOWED_AMINO_ACIDS = set(
+    "ACDEFGHIKLMNPQRSTVWY"
+)
+
 
 # ================================================================================================
 # 4. REPOSITORY ROOT
@@ -131,7 +145,6 @@ def locate_repository_root():
 
     candidates = []
 
-    # Streamlit Cloud normally executes from the repository root.
     try:
         candidates.append(
             Path.cwd()
@@ -139,7 +152,6 @@ def locate_repository_root():
     except Exception:
         pass
 
-    # app.py location
     try:
         candidates.append(
             Path(__file__).resolve().parent
@@ -147,14 +159,25 @@ def locate_repository_root():
     except Exception:
         pass
 
-    # Common Streamlit Cloud location
     candidates.append(
-        Path("/mount/src/hiv1-subtypes-recombinants")
+        Path(
+            "/mount/src/hiv1-subtypes-recombinants"
+        )
     )
+
+    seen = set()
 
     for candidate in candidates:
 
-        candidate = candidate.resolve()
+        try:
+            candidate = candidate.resolve()
+        except Exception:
+            continue
+
+        if candidate in seen:
+            continue
+
+        seen.add(candidate)
 
         if (
             candidate.exists()
@@ -167,7 +190,6 @@ def locate_repository_root():
 
             return candidate
 
-    # Fallback
     return Path.cwd().resolve()
 
 
@@ -190,32 +212,13 @@ def locate_artifacts():
 
     found = {}
 
-    search_roots = []
-
-    # Primary repository root
-    search_roots.append(
-        PROJECT_ROOT
-    )
-
-    # Explicit artifacts directory
-    search_roots.append(
-        PROJECT_ROOT / "artifacts"
-    )
-
-    # Current working directory
-    try:
-        search_roots.append(
-            Path.cwd()
-        )
-    except Exception:
-        pass
-
-    # Streamlit mount root
-    search_roots.append(
+    search_roots = [
+        PROJECT_ROOT,
+        PROJECT_ROOT / "artifacts",
+        Path.cwd(),
         Path("/mount/src/hiv1-subtypes-recombinants")
-    )
+    ]
 
-    # Remove duplicates
     unique_roots = []
 
     for root in search_roots:
@@ -229,7 +232,7 @@ def locate_artifacts():
             unique_roots.append(root)
 
     # ------------------------------------------------------------------
-    # First search exact expected locations
+    # Exact locations first
     # ------------------------------------------------------------------
 
     for root in unique_roots:
@@ -242,13 +245,15 @@ def locate_artifacts():
             candidate = root / filename
 
             if candidate.is_file():
-
                 found[key] = candidate
 
-            candidate = root / "artifacts" / filename
+            candidate = (
+                root
+                / "artifacts"
+                / filename
+            )
 
             if candidate.is_file():
-
                 found[key] = candidate
 
     # ------------------------------------------------------------------
@@ -273,9 +278,11 @@ def locate_artifacts():
 
                 if matches:
 
-                    # Prefer shallowest path
                     matches.sort(
-                        key=lambda p: len(p.parts)
+                        key=lambda p: (
+                            len(p.parts),
+                            str(p)
+                        )
                     )
 
                     found[key] = matches[0]
@@ -307,7 +314,7 @@ THRESHOLD_PATH = ARTIFACTS.get(
 
 
 # ================================================================================================
-# 6. DISPLAY ARTIFACT STATUS
+# 6. ARTIFACT STATUS
 # ================================================================================================
 
 def artifact_status():
@@ -331,7 +338,6 @@ def artifact_status():
     for label, path in required.items():
 
         if path is None:
-
             missing.append(label)
 
     return required, missing
@@ -582,35 +588,26 @@ class BidirectionalAttentionTransformerEncoder(
     ):
 
         # ------------------------------------------------------------
-        # CRITICAL SHAPE PROTECTION
+        # Normalize input dimensionality
         #
-        # Model MUST receive:
+        # Accepted:
         #
-        #     [batch, tokens, features]
+        # [91, 2560]
+        # [batch, 91, 2560]
         #
-        # e.g.
-        #
-        #     [1, 91, 2560]
-        #
-        # NOT:
-        #
-        #     [1, 1, 91, 2560]
+        # Accidental singleton 4-D dimensions are also handled.
         # ------------------------------------------------------------
 
         if x.ndim == 2:
 
-            # [tokens, features]
             x = x.unsqueeze(0)
 
         elif x.ndim == 3:
 
-            # Already correct:
-            # [batch, tokens, features]
             pass
 
         elif x.ndim == 4:
 
-            # Remove accidental singleton dimension.
             if x.shape[1] == 1:
 
                 x = x.squeeze(1)
@@ -622,7 +619,7 @@ class BidirectionalAttentionTransformerEncoder(
             else:
 
                 raise ValueError(
-                    "MODEL-09 received an unsupported 4-D "
+                    "MODEL-09 received unsupported 4-D "
                     f"tensor shape: {tuple(x.shape)}"
                 )
 
@@ -637,9 +634,13 @@ class BidirectionalAttentionTransformerEncoder(
 
             raise ValueError(
                 "MODEL-09 input could not be normalized "
-                f"to [batch, tokens, features]. "
+                "to [batch, tokens, features]. "
                 f"Current shape: {tuple(x.shape)}"
             )
+
+        # ------------------------------------------------------------
+        # Feature dimension
+        # ------------------------------------------------------------
 
         if x.shape[-1] != INPUT_DIM:
 
@@ -649,9 +650,17 @@ class BidirectionalAttentionTransformerEncoder(
                 f"received {x.shape[-1]}."
             )
 
+        # ------------------------------------------------------------
+        # Token length protection
+        # ------------------------------------------------------------
+
         if x.shape[1] > TOKEN_LENGTH:
 
-            x = x[:, :TOKEN_LENGTH, :]
+            x = x[
+                :,
+                :TOKEN_LENGTH,
+                :
+            ]
 
         elif x.shape[1] < TOKEN_LENGTH:
 
@@ -671,9 +680,17 @@ class BidirectionalAttentionTransformerEncoder(
                 dim=1
             )
 
+        # ------------------------------------------------------------
+        # Input projection
+        # ------------------------------------------------------------
+
         x = self.input_projection(
             x
         )
+
+        # ------------------------------------------------------------
+        # Representation noise
+        # ------------------------------------------------------------
 
         if (
             self.training
@@ -688,15 +705,25 @@ class BidirectionalAttentionTransformerEncoder(
                 * REPRESENTATION_NOISE
             )
 
+        # ------------------------------------------------------------
+        # Positional embedding
+        # ------------------------------------------------------------
+
         T = x.size(1)
 
         x = (
             x
             +
             self.position_embedding[
-                :, :T, :
+                :,
+                :T,
+                :
             ]
         )
+
+        # ------------------------------------------------------------
+        # Attention blocks
+        # ------------------------------------------------------------
 
         x = self.local_attention(
             x
@@ -706,9 +733,17 @@ class BidirectionalAttentionTransformerEncoder(
             x
         )
 
+        # ------------------------------------------------------------
+        # Attention pooling
+        # ------------------------------------------------------------
+
         pooled, attention = (
             self.pool(x)
         )
+
+        # ------------------------------------------------------------
+        # Classification
+        # ------------------------------------------------------------
 
         logits = self.classifier(
             pooled
@@ -769,27 +804,31 @@ def load_esm_model():
 def load_model09():
 
     if CHECKPOINT_PATH is None:
+
         raise FileNotFoundError(
             "MODEL-09 checkpoint was not found."
         )
 
     if TRAIN_MEAN_PATH is None:
+
         raise FileNotFoundError(
             "Training mean artifact was not found."
         )
 
     if TRAIN_STD_PATH is None:
+
         raise FileNotFoundError(
             "Training standard deviation artifact was not found."
         )
 
     if THRESHOLD_PATH is None:
+
         raise FileNotFoundError(
             "Frozen threshold artifact was not found."
         )
 
     # ------------------------------------------------------------
-    # Load checkpoint
+    # CHECKPOINT
     # ------------------------------------------------------------
 
     checkpoint = torch.load(
@@ -798,10 +837,11 @@ def load_model09():
         weights_only=False
     )
 
-    if isinstance(
-        checkpoint,
-        dict
-    ) and "model_state_dict" in checkpoint:
+    if (
+        isinstance(checkpoint, dict)
+        and
+        "model_state_dict" in checkpoint
+    ):
 
         state_dict = (
             checkpoint[
@@ -818,7 +858,7 @@ def load_model09():
     )
 
     # ------------------------------------------------------------
-    # Strict checkpoint verification
+    # STRICT CHECKPOINT VERIFICATION
     # ------------------------------------------------------------
 
     try:
@@ -840,7 +880,7 @@ def load_model09():
     model.eval()
 
     # ------------------------------------------------------------
-    # Load training statistics
+    # TRAINING MEAN
     # ------------------------------------------------------------
 
     train_mean = np.load(
@@ -849,82 +889,89 @@ def load_model09():
         np.float32
     )
 
+    # ------------------------------------------------------------
+    # TRAINING STD
+    # ------------------------------------------------------------
+
     train_std = np.load(
         TRAIN_STD_PATH
     ).astype(
         np.float32
     )
 
-    expected_shape = (
+    # ------------------------------------------------------------
+    # CRITICAL SHAPE FIX
+    #
+    # Final required shape:
+    #
+    #     [1, 2560]
+    #
+    # This guarantees:
+    #
+    #     [91,2560] - [1,2560]
+    #
+    # remains:
+    #
+    #     [91,2560]
+    #
+    # ------------------------------------------------------------
+
+    if train_mean.size != INPUT_DIM:
+
+        raise ValueError(
+            "Training mean contains the wrong number "
+            f"of values. Expected {INPUT_DIM}, "
+            f"received {train_mean.size}. "
+            f"Original shape: {train_mean.shape}"
+        )
+
+    if train_std.size != INPUT_DIM:
+
+        raise ValueError(
+            "Training std contains the wrong number "
+            f"of values. Expected {INPUT_DIM}, "
+            f"received {train_std.size}. "
+            f"Original shape: {train_std.shape}"
+        )
+
+    train_mean = train_mean.reshape(
         1,
+        INPUT_DIM
+    )
+
+    train_std = train_std.reshape(
         1,
         INPUT_DIM
     )
 
     # ------------------------------------------------------------
-    # Normalize mean shape
+    # VALIDATE TRAINING STATISTICS
     # ------------------------------------------------------------
 
-    if train_mean.shape != expected_shape:
+    if train_mean.shape != (
+        1,
+        INPUT_DIM
+    ):
 
-        if train_mean.shape == (
-            INPUT_DIM,
-        ):
+        raise RuntimeError(
+            "Internal training mean shape error: "
+            f"{train_mean.shape}"
+        )
 
-            train_mean = train_mean.reshape(
-                expected_shape
-            )
+    if train_std.shape != (
+        1,
+        INPUT_DIM
+    ):
 
-        elif train_mean.shape == (
-            1,
-            INPUT_DIM
-        ):
-
-            train_mean = train_mean.reshape(
-                expected_shape
-            )
-
-        else:
-
-            raise ValueError(
-                "Training mean has unexpected shape: "
-                f"{train_mean.shape}. "
-                f"Expected {expected_shape}."
-            )
-
-    # ------------------------------------------------------------
-    # Normalize std shape
-    # ------------------------------------------------------------
-
-    if train_std.shape != expected_shape:
-
-        if train_std.shape == (
-            INPUT_DIM,
-        ):
-
-            train_std = train_std.reshape(
-                expected_shape
-            )
-
-        elif train_std.shape == (
-            1,
-            INPUT_DIM
-        ):
-
-            train_std = train_std.reshape(
-                expected_shape
-            )
-
-        else:
-
-            raise ValueError(
-                "Training std has unexpected shape: "
-                f"{train_std.shape}. "
-                f"Expected {expected_shape}."
-            )
+        raise RuntimeError(
+            "Internal training std shape error: "
+            f"{train_std.shape}"
+        )
 
     if not np.all(
-        np.isfinite(train_mean)
+        np.isfinite(
+            train_mean
+        )
     ):
 
         raise ValueError(
@@ -932,7 +979,9 @@ def load_model09():
         )
 
     if not np.all(
-        np.isfinite(train_std)
+        np.isfinite(
+            train_std
+        )
     ):
 
         raise ValueError(
@@ -948,7 +997,7 @@ def load_model09():
         )
 
     # ------------------------------------------------------------
-    # Load frozen threshold
+    # FROZEN THRESHOLD
     # ------------------------------------------------------------
 
     threshold_text = (
@@ -973,9 +1022,7 @@ def load_model09():
         )
 
     threshold = float(
-        threshold_match.group(
-            0
-        )
+        threshold_match.group(0)
     )
 
     if not (
@@ -985,7 +1032,7 @@ def load_model09():
     ):
 
         raise ValueError(
-            f"Frozen threshold must be between 0 and 1. "
+            "Frozen threshold must be between 0 and 1. "
             f"Received {threshold}."
         )
 
@@ -1001,7 +1048,9 @@ def load_model09():
 # 10. PROTEIN SEQUENCE CLEANING / VALIDATION
 # ================================================================================================
 
-def normalize_sequence(raw_sequence):
+def normalize_sequence(
+    raw_sequence
+):
 
     if raw_sequence is None:
 
@@ -1013,7 +1062,6 @@ def normalize_sequence(raw_sequence):
         raw_sequence
     )
 
-    # Remove FASTA header
     lines = sequence.splitlines()
 
     cleaned_lines = []
@@ -1036,7 +1084,6 @@ def normalize_sequence(raw_sequence):
         cleaned_lines
     )
 
-    # Remove whitespace
     sequence = re.sub(
         r"\s+",
         "",
@@ -1077,7 +1124,7 @@ def normalize_sequence(raw_sequence):
 
 
 # ================================================================================================
-# 11. ESM-2 RESIDUE EMBEDDING
+# 11. ESM-2 RESIDUE EMBEDDINGS
 # ================================================================================================
 
 def get_residue_embeddings(
@@ -1087,25 +1134,22 @@ def get_residue_embeddings(
 ):
 
     # ------------------------------------------------------------
-    # IMPORTANT:
+    # ESM-2 WINDOWING
     #
-    # ESM-2 has a token limit.
-    #
-    # Whole HIV-1 proteins can be > 4,000 aa.
-    #
-    # Therefore process in overlapping windows.
-    #
-    # The benchmark source embeddings were produced using:
-    #
-    #     chunk/window = 1024 aa
-    #     overlap      = 128 aa
-    #     stride       = 896 aa
-    #
+    # Window = 1024 aa
+    # Overlap = 128 aa
+    # Stride = 896 aa
     # ------------------------------------------------------------
 
     WINDOW_SIZE = 1024
+
     OVERLAP = 128
-    STRIDE = WINDOW_SIZE - OVERLAP
+
+    STRIDE = (
+        WINDOW_SIZE
+        -
+        OVERLAP
+    )
 
     sequence_length = len(
         sequence
@@ -1153,9 +1197,12 @@ def get_residue_embeddings(
                 **inputs
             )
 
-            hidden = outputs.last_hidden_state
+            hidden = (
+                outputs
+                .last_hidden_state
+            )
 
-            # Remove BOS/EOS
+            # Remove BOS and EOS
             residue_hidden = (
                 hidden[
                     0,
@@ -1175,7 +1222,11 @@ def get_residue_embeddings(
                 end - start
             )
 
-            if residue_hidden.shape[0] != expected_length:
+            if (
+                residue_hidden.shape[0]
+                !=
+                expected_length
+            ):
 
                 raise RuntimeError(
                     "ESM-2 residue length mismatch. "
@@ -1206,14 +1257,21 @@ def get_residue_embeddings(
         counts[:, None]
     )
 
-    if residue_embeddings.shape != (
+    expected_residue_shape = (
         sequence_length,
         ESM2_DIMENSION
+    )
+
+    if (
+        residue_embeddings.shape
+        !=
+        expected_residue_shape
     ):
 
         raise RuntimeError(
             "Unexpected residue embedding shape: "
-            f"{residue_embeddings.shape}"
+            f"{residue_embeddings.shape}. "
+            f"Expected {expected_residue_shape}."
         )
 
     return residue_embeddings
@@ -1234,7 +1292,11 @@ def residue_to_tokens(
             f"Received {residue_embeddings.shape}"
         )
 
-    if residue_embeddings.shape[1] != ESM2_DIMENSION:
+    if (
+        residue_embeddings.shape[1]
+        !=
+        ESM2_DIMENSION
+    ):
 
         raise ValueError(
             "Residue embedding dimension mismatch. "
@@ -1246,10 +1308,14 @@ def residue_to_tokens(
         residue_embeddings.shape[0]
     )
 
-    # Complete chunks ONLY.
+    # ------------------------------------------------------------
+    # COMPLETE 48-AA CHUNKS ONLY
+    # ------------------------------------------------------------
+
     n_complete = (
         sequence_length
-        // CHUNK_SIZE
+        //
+        CHUNK_SIZE
     )
 
     if n_complete < 1:
@@ -1261,7 +1327,8 @@ def residue_to_tokens(
 
     usable_length = (
         n_complete
-        * CHUNK_SIZE
+        *
+        CHUNK_SIZE
     )
 
     residues = (
@@ -1296,19 +1363,26 @@ def residue_to_tokens(
         axis=1
     )
 
-    if tokens.shape[1] != INPUT_DIM:
+    expected_shape = (
+        n_complete,
+        INPUT_DIM
+    )
+
+    if tokens.shape != expected_shape:
 
         raise RuntimeError(
-            "Token feature dimension mismatch. "
-            f"Expected {INPUT_DIM}, "
-            f"received {tokens.shape[1]}."
+            "Token representation shape mismatch. "
+            f"Expected {expected_shape}, "
+            f"received {tokens.shape}."
         )
 
-    return tokens
+    return tokens.astype(
+        np.float32
+    )
 
 
 # ================================================================================================
-# 13. PAD / TRUNCATE TO 91 TOKENS
+# 13. PAD / TRUNCATE TO EXACTLY 91 TOKENS
 # ================================================================================================
 
 def fix_token_length(
@@ -1322,15 +1396,25 @@ def fix_token_length(
             f"Received {tokens.shape}"
         )
 
-    if tokens.shape[1] != INPUT_DIM:
+    if (
+        tokens.shape[1]
+        !=
+        INPUT_DIM
+    ):
 
         raise ValueError(
-            "Token feature dimension mismatch."
+            "Token feature dimension mismatch. "
+            f"Expected {INPUT_DIM}, "
+            f"received {tokens.shape[1]}."
         )
 
     raw_tokens = (
         tokens.shape[0]
     )
+
+    # ------------------------------------------------------------
+    # Truncate
+    # ------------------------------------------------------------
 
     if raw_tokens >= TOKEN_LENGTH:
 
@@ -1340,12 +1424,17 @@ def fix_token_length(
             ]
         )
 
+    # ------------------------------------------------------------
+    # Pad
+    # ------------------------------------------------------------
+
     else:
 
         padding = np.zeros(
             (
                 TOKEN_LENGTH
-                - raw_tokens,
+                -
+                raw_tokens,
                 INPUT_DIM
             ),
             dtype=np.float32
@@ -1357,6 +1446,19 @@ def fix_token_length(
                 padding
             ],
             axis=0
+        )
+
+    expected_shape = (
+        TOKEN_LENGTH,
+        INPUT_DIM
+    )
+
+    if final_tokens.shape != expected_shape:
+
+        raise RuntimeError(
+            "Final token representation has "
+            f"unexpected shape: {final_tokens.shape}. "
+            f"Expected {expected_shape}."
         )
 
     return final_tokens.astype(
@@ -1374,25 +1476,119 @@ def standardize_tokens(
     train_std
 ):
 
-    tokens = tokens.astype(
-        np.float32
+    tokens = np.asarray(
+        tokens,
+        dtype=np.float32
     )
 
-    if tokens.shape != (
+    # ------------------------------------------------------------
+    # Input must be:
+    #
+    # [91, 2560]
+    # ------------------------------------------------------------
+
+    expected_token_shape = (
         TOKEN_LENGTH,
         INPUT_DIM
-    ):
+    )
+
+    if tokens.shape != expected_token_shape:
 
         raise ValueError(
             "Unexpected token matrix shape before "
-            f"standardization: {tokens.shape}"
+            f"standardization: {tokens.shape}. "
+            f"Expected {expected_token_shape}."
         )
+
+    train_mean = np.asarray(
+        train_mean,
+        dtype=np.float32
+    )
+
+    train_std = np.asarray(
+        train_std,
+        dtype=np.float32
+    )
+
+    # ------------------------------------------------------------
+    # Statistics must contain exactly 2560 values.
+    # ------------------------------------------------------------
+
+    if train_mean.size != INPUT_DIM:
+
+        raise ValueError(
+            "Training mean does not contain exactly "
+            f"{INPUT_DIM} values. "
+            f"Received shape: {train_mean.shape}."
+        )
+
+    if train_std.size != INPUT_DIM:
+
+        raise ValueError(
+            "Training std does not contain exactly "
+            f"{INPUT_DIM} values. "
+            f"Received shape: {train_std.shape}."
+        )
+
+    # ------------------------------------------------------------
+    # CRITICAL:
+    #
+    # Always force:
+    #
+    #     [2560]
+    #
+    # to:
+    #
+    #     [1,2560]
+    #
+    # NOT:
+    #
+    #     [1,1,2560]
+    #
+    # ------------------------------------------------------------
+
+    train_mean = train_mean.reshape(
+        1,
+        INPUT_DIM
+    )
+
+    train_std = train_std.reshape(
+        1,
+        INPUT_DIM
+    )
+
+    if np.any(
+        train_std <= 0
+    ):
+
+        raise ValueError(
+            "Training std contains zero or negative values."
+        )
+
+    # ------------------------------------------------------------
+    # Standardization
+    #
+    # [91,2560]
+    #      -
+    # [1,2560]
+    #      =
+    # [91,2560]
+    # ------------------------------------------------------------
 
     standardized = (
         tokens
         -
         train_mean
     ) / train_std
+
+    if standardized.shape != expected_token_shape:
+
+        raise RuntimeError(
+            "Standardization unexpectedly changed the "
+            f"MODEL-09 shape. "
+            f"Received {standardized.shape}; "
+            f"expected {expected_token_shape}."
+        )
 
     if not np.all(
         np.isfinite(
@@ -1425,7 +1621,7 @@ def predict_model09(
 ):
 
     # ------------------------------------------------------------
-    # Sequence validation
+    # 1. NORMALIZE SEQUENCE
     # ------------------------------------------------------------
 
     sequence = normalize_sequence(
@@ -1433,7 +1629,7 @@ def predict_model09(
     )
 
     # ------------------------------------------------------------
-    # ESM-2
+    # 2. ESM-2 RESIDUE EMBEDDINGS
     # ------------------------------------------------------------
 
     residue_embeddings = (
@@ -1445,7 +1641,7 @@ def predict_model09(
     )
 
     # ------------------------------------------------------------
-    # Residue → 2560-D tokens
+    # 3. RESIDUE → 2560-D TOKENS
     # ------------------------------------------------------------
 
     raw_tokens = (
@@ -1459,7 +1655,7 @@ def predict_model09(
     )
 
     # ------------------------------------------------------------
-    # Exactly 91 tokens
+    # 4. PAD / TRUNCATE → 91 TOKENS
     # ------------------------------------------------------------
 
     final_tokens = (
@@ -1469,7 +1665,9 @@ def predict_model09(
     )
 
     # ------------------------------------------------------------
-    # TRAIN-ONLY standardization
+    # 5. TRAIN-ONLY STANDARDIZATION
+    #
+    # Must remain [91,2560]
     # ------------------------------------------------------------
 
     standardized = (
@@ -1480,18 +1678,25 @@ def predict_model09(
         )
     )
 
+    if standardized.shape != (
+        TOKEN_LENGTH,
+        INPUT_DIM
+    ):
+
+        raise RuntimeError(
+            "Unexpected standardized MODEL-09 shape: "
+            f"{standardized.shape}. "
+            f"Expected "
+            f"{(TOKEN_LENGTH, INPUT_DIM)}."
+        )
+
     # ------------------------------------------------------------
-    # CRITICAL:
+    # 6. CONVERT TO TORCH
     #
-    # standardized shape:
+    # Before batch:
     #
-    #     [91, 2560]
+    #     [91,2560]
     #
-    # Add ONE batch dimension:
-    #
-    #     [1, 91, 2560]
-    #
-    # Do NOT add two dimensions.
     # ------------------------------------------------------------
 
     model_input = torch.from_numpy(
@@ -1502,19 +1707,38 @@ def predict_model09(
 
         raise RuntimeError(
             "Unexpected pre-batch MODEL-09 shape: "
-            f"{tuple(model_input.shape)}"
+            f"{tuple(model_input.shape)}. "
+            "Expected (91,2560)."
         )
+
+    if tuple(
+        model_input.shape
+    ) != (
+        TOKEN_LENGTH,
+        INPUT_DIM
+    ):
+
+        raise RuntimeError(
+            "Unexpected pre-batch MODEL-09 shape: "
+            f"{tuple(model_input.shape)}. "
+            f"Expected "
+            f"{(TOKEN_LENGTH, INPUT_DIM)}."
+        )
+
+    # ------------------------------------------------------------
+    # 7. ADD EXACTLY ONE BATCH DIMENSION
+    #
+    #     [91,2560]
+    #          ↓
+    #     [1,91,2560]
+    # ------------------------------------------------------------
 
     model_input = (
         model_input
         .unsqueeze(0)
     )
 
-    # ------------------------------------------------------------
-    # Final shape assertion
-    # ------------------------------------------------------------
-
-    expected_shape = (
+    expected_model_shape = (
         1,
         TOKEN_LENGTH,
         INPUT_DIM
@@ -1522,16 +1746,16 @@ def predict_model09(
 
     if tuple(
         model_input.shape
-    ) != expected_shape:
+    ) != expected_model_shape:
 
         raise RuntimeError(
             "MODEL-09 input shape mismatch. "
-            f"Expected {expected_shape}, "
-            f"received {tuple(model_input.shape)}"
+            f"Expected {expected_model_shape}, "
+            f"received {tuple(model_input.shape)}."
         )
 
     # ------------------------------------------------------------
-    # Inference
+    # 8. MODEL INFERENCE
     # ------------------------------------------------------------
 
     model.eval()
@@ -1553,37 +1777,68 @@ def predict_model09(
             .reshape(-1)[0]
         )
 
+    probability = float(
+        probability
+    )
+
+    # ------------------------------------------------------------
+    # 9. FROZEN THRESHOLD
+    # ------------------------------------------------------------
+
     prediction = int(
         probability
-        >= frozen_threshold
+        >=
+        frozen_threshold
     )
 
     if prediction == 1:
 
-        label = "RECOMBINANT"
+        label = (
+            "RECOMBINANT"
+        )
 
     else:
 
-        label = "NON-RECOMBINANT"
+        label = (
+            "NON-RECOMBINANT"
+        )
+
+    # ------------------------------------------------------------
+    # 10. RETURN
+    # ------------------------------------------------------------
 
     return {
         "sequence": sequence,
-        "length": len(sequence),
-        "raw_token_count": raw_token_count,
-        "final_token_count": TOKEN_LENGTH,
-        "probability": float(
-            probability
+
+        "length": len(
+            sequence
         ),
+
+        "raw_token_count": int(
+            raw_token_count
+        ),
+
+        "final_token_count": int(
+            TOKEN_LENGTH
+        ),
+
+        "probability": probability,
+
         "threshold": float(
             frozen_threshold
         ),
+
         "prediction": prediction,
+
         "label": label,
-        "attention": attention
+
+        "attention": (
+            attention
             .detach()
             .cpu()
             .numpy()
             .reshape(-1)
+        )
     }
 
 
@@ -1613,24 +1868,49 @@ if MISSING_ARTIFACTS:
     st.code(
         "\n".join(
             [
-                "Required MODEL-09 deployment artifacts were not found.",
+                "Required MODEL-09 deployment artifacts "
+                "were not found.",
                 "",
-                f"Repository root detected:",
+                "Repository root detected:",
                 str(PROJECT_ROOT),
                 "",
                 "Artifact search status:",
                 "",
-                f"MODEL-09 checkpoint: "
-                f"{CHECKPOINT_PATH if CHECKPOINT_PATH else 'MISSING'}",
+                "MODEL-09 checkpoint: "
+                +
+                (
+                    str(CHECKPOINT_PATH)
+                    if CHECKPOINT_PATH
+                    else
+                    "MISSING"
+                ),
                 "",
-                f"Training mean: "
-                f"{TRAIN_MEAN_PATH if TRAIN_MEAN_PATH else 'MISSING'}",
+                "Training mean: "
+                +
+                (
+                    str(TRAIN_MEAN_PATH)
+                    if TRAIN_MEAN_PATH
+                    else
+                    "MISSING"
+                ),
                 "",
-                f"Training std: "
-                f"{TRAIN_STD_PATH if TRAIN_STD_PATH else 'MISSING'}",
+                "Training std: "
+                +
+                (
+                    str(TRAIN_STD_PATH)
+                    if TRAIN_STD_PATH
+                    else
+                    "MISSING"
+                ),
                 "",
-                f"Frozen threshold: "
-                f"{THRESHOLD_PATH if THRESHOLD_PATH else 'MISSING'}",
+                "Frozen threshold: "
+                +
+                (
+                    str(THRESHOLD_PATH)
+                    if THRESHOLD_PATH
+                    else
+                    "MISSING"
+                ),
                 "",
                 "Expected filenames:",
                 CHECKPOINT_NAME,
@@ -1643,10 +1923,8 @@ if MISSING_ARTIFACTS:
     )
 
     st.warning(
-        "The files must be committed to the GitHub repository "
-        "that Streamlit Cloud is deploying. The app now searches "
-        "recursively, so they do not have to be directly under "
-        "artifacts/, but their filenames must be exact."
+        "Commit all four MODEL-09 artifacts to the GitHub "
+        "repository used by Streamlit Cloud."
     )
 
     st.stop()
@@ -1665,7 +1943,7 @@ try:
         FROZEN_THRESHOLD
     ) = load_model09()
 
-except Exception as exc:
+except Exception:
 
     st.error(
         "MODEL-09 could not be initialized."
@@ -1689,11 +1967,12 @@ try:
         "Loading ESM-2 model..."
     ):
 
-        TOKENIZER, ESM_MODEL = (
-            load_esm_model()
-        )
+        (
+            TOKENIZER,
+            ESM_MODEL
+        ) = load_esm_model()
 
-except Exception as exc:
+except Exception:
 
     st.error(
         "ESM-2 could not be loaded."
@@ -1745,6 +2024,21 @@ with st.expander(
     )
 
     st.write(
+        "Training mean runtime shape:",
+        str(TRAIN_MEAN.shape)
+    )
+
+    st.write(
+        "Training std runtime shape:",
+        str(TRAIN_STD.shape)
+    )
+
+    st.write(
+        "ESM-2 model:",
+        ESM_MODEL_NAME
+    )
+
+    st.write(
         "ESM-2 dimension:",
         ESM2_DIMENSION
     )
@@ -1767,6 +2061,16 @@ with st.expander(
     st.write(
         "Token length:",
         TOKEN_LENGTH
+    )
+
+    st.write(
+        "Model dimension:",
+        MODEL_DIM
+    )
+
+    st.write(
+        "Attention heads:",
+        ATTENTION_HEADS
     )
 
 
@@ -1811,7 +2115,7 @@ with st.expander(
 
 
 # ================================================================================================
-# 23. PREDICT BUTTON
+# 23. PREDICTION
 # ================================================================================================
 
 if st.button(
@@ -1831,7 +2135,8 @@ if st.button(
     try:
 
         with st.spinner(
-            "Running ESM-2 → tokenization → MODEL-09..."
+            "Running ESM-2 → tokenization → "
+            "standardization → MODEL-09..."
         ):
 
             result = predict_model09(
@@ -1865,7 +2170,7 @@ if st.button(
             )
 
         # --------------------------------------------------------
-        # Probability
+        # PROBABILITY
         # --------------------------------------------------------
 
         st.metric(
@@ -1874,7 +2179,7 @@ if st.button(
         )
 
         # --------------------------------------------------------
-        # Threshold
+        # THRESHOLD
         # --------------------------------------------------------
 
         st.metric(
@@ -1883,7 +2188,7 @@ if st.button(
         )
 
         # --------------------------------------------------------
-        # Input information
+        # INPUT INFORMATION
         # --------------------------------------------------------
 
         st.write(
@@ -1902,14 +2207,20 @@ if st.button(
         )
 
         st.write(
+            "**Final model input shape:** "
+            "`(1, 91, 2560)`"
+        )
+
+        st.write(
             "**Representation:** "
-            "ESM-2 residue embeddings → mean + max → "
-            "2560-D tokens → 91-token representation → "
+            "ESM-2 residue embeddings → complete "
+            "48-aa chunks → mean + max → 2560-D "
+            "tokens → 91-token representation → "
             "train-only standardization"
         )
 
         # --------------------------------------------------------
-        # Attention
+        # ATTENTION
         # --------------------------------------------------------
 
         attention = result[
@@ -1922,7 +2233,6 @@ if st.button(
                 "MODEL-09 Attention Summary"
             )
 
-            # Remove padded tail from visualization
             valid_tokens = min(
                 result["raw_token_count"],
                 TOKEN_LENGTH
@@ -1941,8 +2251,8 @@ if st.button(
                 )
 
                 st.caption(
-                    "Relative attention weight across complete "
-                    "48-aa protein tokens."
+                    "Relative MODEL-09 attention weight "
+                    "across complete 48-aa protein tokens."
                 )
 
     except ValueError as exc:
@@ -1956,7 +2266,7 @@ if st.button(
             language="text"
         )
 
-    except Exception as exc:
+    except Exception:
 
         st.error(
             "Prediction failed."
